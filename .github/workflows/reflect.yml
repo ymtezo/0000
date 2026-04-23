@@ -1,0 +1,91 @@
+name: Journal Reflect
+
+on:
+  push:
+    paths:
+      - 'journal/entries/*.md'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  reflect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Find inbox entries
+        id: find
+        run: |
+          files=""
+          for f in journal/entries/*.md; do
+            [ -f "$f" ] || continue
+            stage="$(sed -n 's/^stage: *//p' "$f")"
+            if [ "$stage" = "inbox" ]; then
+              files="$files $f"
+            fi
+          done
+          files="$(echo "$files" | xargs)"
+          echo "files=$files" >> "$GITHUB_OUTPUT"
+          if [ -z "$files" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run reflection via Claude API
+        if: steps.find.outputs.skip == 'false'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          for filepath in ${{ steps.find.outputs.files }}; do
+            content="$(cat "$filepath")"
+            filename="$(basename "$filepath")"
+
+            reflection="$(curl -s https://api.anthropic.com/v1/messages \
+              -H "x-api-key: $ANTHROPIC_API_KEY" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "content-type: application/json" \
+              -d "$(jq -n --arg content "$content" '{
+                model: "claude-sonnet-4-20250514",
+                max_tokens: 1024,
+                messages: [{
+                  role: "user",
+                  content: ("以下のジャーナルエントリを読み、ふり返りを日本語で書いてください。\n\n要件:\n1. 記入内容の要約（2-3文）\n2. 学びやパターンの抽出\n3. 具体的な次のアクション提案\n\nMarkdownで「## ふり返り（自動生成）」の見出しから始めてください。\n\n---\n" + $content)
+                }]
+              }')" | jq -r '.content[0].text')"
+
+            date_str="$(date +%Y-%m-%d)"
+            sed -i "s/^stage: inbox/stage: reflected/" "$filepath"
+            sed -i "s/^reflected_at: \"\"/reflected_at: ${date_str}/" "$filepath"
+            printf "\n%s\n" "$reflection" >> "$filepath"
+
+            echo "Reflected: $filename"
+          done
+
+      - name: Create PR
+        if: steps.find.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          branch="reflect/$(date +%Y%m%d-%H%M%S)"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add journal/entries/
+          git commit -m "reflect: auto-reflection on inbox entries"
+          git push -u origin "$branch"
+
+          body="## 自動ふり返り\n\nAIによるふり返りが追記されました。\n\n### 対象ファイル\n"
+          for f in ${{ steps.find.outputs.files }}; do
+            body="$body\n- \`$(basename "$f")\`"
+          done
+          body="$body\n\n### 変更差分\n\n\`\`\`diff\n$(git diff HEAD~1)\n\`\`\`"
+
+          gh pr create \
+            --title "reflect: $(date +%Y-%m-%d) journal entries" \
+            --body "$(echo -e "$body")" \
+            --base "$(git rev-parse --abbrev-ref HEAD@{upstream} 2>/dev/null | sed 's|origin/||' || echo main)"
